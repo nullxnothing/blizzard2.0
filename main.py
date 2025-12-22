@@ -551,9 +551,6 @@ def lottery_worker(client: Client, worker_keypair: Keypair):
     log("SYSTEM", "🎰 Lottery Engine: ACTIVE (Interval: 1m DEBUG)", Style.CYAN)
     
     while True:
-        # Sleep 1 minute (DEBUG MODE)
-        time.sleep(60)
-        
         try:
             # 1. Check Balance
             my_pub = str(worker_keypair.pubkey())
@@ -562,6 +559,7 @@ def lottery_worker(client: Client, worker_keypair: Keypair):
             # Threshold: Don't sending dust. At least 0.02 SOL available.
             if bal < 0.02:
                 log("LOTTERY", f"Skipping: Low Balance ({bal:.3f} SOL)", Style.DIM)
+                time.sleep(60)  # Sleep before next iteration
                 continue
                 
             # 2. Calculate Prize (10% of Available)
@@ -569,12 +567,14 @@ def lottery_worker(client: Client, worker_keypair: Keypair):
             available = bal - GAS_RESERVE
             if available <= 0: 
                  log("LOTTERY", f"Skipping: No available funds after gas. ({bal:.4f} SOL)", Style.DIM)
+                 time.sleep(60)
                  continue
             
             prize = available * 0.10
             
             if prize < 0.0001: 
                 log("LOTTERY", f"Skipping: Prize too small ({prize:.6f} SOL)", Style.DIM)
+                time.sleep(60)
                 continue
 
             log("LOTTERY", f"🎲 Running Draw... Prize: {prize:.4f} SOL", Style.MAGENTA)
@@ -586,6 +586,7 @@ def lottery_worker(client: Client, worker_keypair: Keypair):
                  # Prevent self-transfer
                 if winner_pub == my_pub:
                     log("LOTTERY", "Winner was self. Retrying next round.", Style.DIM)
+                    time.sleep(60)
                     continue
 
                 log("LOTTERY", f"🏆 Winner Selected: {winner_pub[:6]}...{winner_pub[-4:]}", Style.GREEN)
@@ -598,7 +599,12 @@ def lottery_worker(client: Client, worker_keypair: Keypair):
                  log("LOTTERY", "⚠️ Could not fetch holders. Skipping.", Style.YELLOW)
 
         except Exception as e:
-            log("ERROR", f"Lottery: {e}", Style.RED) 
+            import traceback
+            log("ERROR", f"Lottery Exception: {e}", Style.RED)
+            log("ERROR", f"Traceback: {traceback.format_exc()}", Style.RED)
+        
+        # Sleep at END of loop so first execution is immediate
+        time.sleep(60) 
 
 # --- WORKER: EXECUTOR THREAD ---
 def trade_executor_worker(client: Client, keypair: Keypair):
