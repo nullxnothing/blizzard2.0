@@ -126,8 +126,7 @@ TRIGGER_THRESHOLD = float(os.getenv("TRIGGER_THRESHOLD", "0.5"))
 GAS_RESERVE = float(os.getenv("GAS_RESERVE", "0.02"))
 PRIORITY_FEE = float(os.getenv("PRIORITY_FEE", "0.005"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "1"))
-SLIPPAGE = int(os.getenv("SLIPPAGE", "50"))
-POOL = os.getenv("POOL", "pump")
+SLIPPAGE = int(os.getenv("SLIPPAGE", "15"))  # Percentage for Solana Tracker API
 
 # V4.1 ACCUMULATION SETTINGS
 BUY_PCT = int(os.getenv("BUY_PCT", "100")) 
@@ -148,8 +147,13 @@ DEV_WALLET = os.getenv("DEV_WALLET", "3CNH1A7NDRCJZ28y1Zm7cPhRuhgEMeKsBSs97Ez1gY
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
-PUMPPORTAL_API = "https://pumpportal.fun/api/trade-local"
-PUMPPORTAL_WS = "wss://pumpportal.fun/api/data"
+# PumpPortal API (Fee Claiming)
+PUMPPORTAL_TRADE_API = "https://pumpportal.fun/api/trade-local"
+
+# Solana Tracker Swap API (Aggregates Jupiter)
+SOLANATRACKER_API_KEY = os.getenv("SOLANATRACKER_API_KEY", "")
+SOLANATRACKER_SWAP_API = "https://swap-api.solanatracker.io"
+SOL_MINT = "So11111111111111111111111111111111111111112"  # Wrapped SOL
 LAMPORTS_PER_SOL = 1_000_000_000
 
 # THREAD SAFETY & QUEUES
@@ -193,46 +197,107 @@ def get_sol_balance(client: Client, pubkey_str: str) -> float:
         pass
     return 0.0
 
-def fetch_trade_transaction(mint: str, amount_sol: float, pubkey: str, action="buy", pool_override=None) -> bytes | None:
-    current_pool = pool_override if pool_override else POOL
-
-    payload = {
-        "publicKey": pubkey,
-        "action": action,
-        "mint": mint,
-        "amount": amount_sol if action == "buy" else f"{SELL_PCT}%",
-        "denominatedInSol": "true" if action == "buy" else "false",
-        "slippage": SLIPPAGE,
-        "priorityFee": PRIORITY_FEE,
-        "pool": current_pool
-    }
+def get_token_balance_lamports(client: Client, wallet: str, mint: str) -> int:
+    """Get SPL token balance in lamports (raw token units)"""
     try:
-        # DEBUG: Print payload to diagnose 400 error
-        print(f"{Style.DIM}DEBUG PAYLOAD: {json.dumps(payload)}{Style.RESET}")
+        from solana.rpc.types import TokenAccountOpts
         
-        response = requests.post(PUMPPORTAL_API, json=payload, timeout=5)
-        if response.status_code == 200:
-            return response.content
-        elif response.status_code >= 400:
-            log("API_WARN", f"API {response.status_code} on {current_pool}: {response.text}", Style.YELLOW)
+        wallet_pubkey = Pubkey.from_string(wallet)
+        mint_pubkey = Pubkey.from_string(mint)
+        
+        # Get token accounts for this mint using TokenAccountOpts
+        opts = TokenAccountOpts(mint=mint_pubkey, encoding="jsonParsed")
+        response = client.get_token_accounts_by_owner_json_parsed(
+            wallet_pubkey,
+            opts
+        )
+        
+        if response.value:
+            for account in response.value:
+                parsed = account.account.data.parsed
+                if parsed and "info" in parsed:
+                    token_amount = parsed["info"]["tokenAmount"]["amount"]
+                    return int(token_amount)
+        return 0
+    except Exception as e:
+        log("WARN", f"Token Balance check failed: {e}", Style.DIM)
+        return 0
+
+def fetch_swap_transaction(from_mint: str, to_mint: str, amount: float, slippage: float, payer: str, priority_fee: float = 0.0005) -> bytes | None:
+    """
+    Get swap transaction from Solana Tracker API (aggregates Jupiter)
+    Returns serialized transaction bytes ready for signing
+    """
+    if not SOLANATRACKER_API_KEY:
+        log("ERROR", "SOLANATRACKER_API_KEY not set!", Style.RED)
         return None
-    except:
+    
+    try:
+        url = f"{SOLANATRACKER_SWAP_API}/swap"
+        params = {
+            "from": from_mint,
+            "to": to_mint,
+            "amount": str(amount),
+            "slippage": str(slippage),
+            "payer": payer,
+            "priorityFee": str(priority_fee),
+            "txVersion": "v0"
+        }
+        headers = {
+            "x-api-key": SOLANATRACKER_API_KEY,
+            "Content-Type": "application/json"
+        }
+        
+        log("SWAP", f"Requesting swap: {amount} from {from_mint[:8]}... to {to_mint[:8]}...", Style.CYAN)
+        
+        response = requests.get(url, params=params, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            tx_data = data.get("txn")
+            if tx_data:
+                import base64
+                return base64.b64decode(tx_data)
+            else:
+                log("ERROR", f"No txn in response: {data}", Style.RED)
+        else:
+            log("ERROR", f"Swap API failed: {response.status_code} - {response.text}", Style.RED)
+        return None
+    except Exception as e:
+        log("ERROR", f"Swap API error: {e}", Style.RED)
         return None
 
-def fetch_claim_fees_transaction(mint: str, pubkey: str) -> bytes | None:
-    payload = {
-        "publicKey": pubkey,
-        "action": "collectCreatorFee",
-        "priorityFee": PRIORITY_FEE,
-        "pool": POOL
-    }
-    try:
-        response = requests.post(PUMPPORTAL_API, json=payload, timeout=10)
-        if response.status_code == 200:
-            return response.content
+def execute_swap(client: Client, keypair: Keypair, input_mint: str, output_mint: str, amount_lamports: int, action_label: str) -> str | None:
+    """
+    Execute swap via Solana Tracker API (aggregates Jupiter)
+    Returns transaction signature or None
+    """
+    user_pubkey = str(keypair.pubkey())
+    
+    # Convert lamports to decimal (SOL or token units)
+    # Solana Tracker expects decimal amounts like 0.1, not lamports
+    amount_decimal = amount_lamports / LAMPORTS_PER_SOL
+    
+    log("SWAP", f"📊 Executing {action_label} ({amount_decimal:.4f})...", Style.CYAN)
+    
+    # Get swap transaction from Solana Tracker
+    swap_tx = fetch_swap_transaction(
+        from_mint=input_mint,
+        to_mint=output_mint,
+        amount=amount_decimal,
+        slippage=SLIPPAGE,
+        payer=user_pubkey,
+        priority_fee=0.0005
+    )
+    
+    if not swap_tx:
+        log("ERROR", "Failed to get swap transaction", Style.RED)
         return None
-    except:
-        return None
+    
+    # Sign and Send
+    sig = sign_and_send_transaction(client, keypair, swap_tx)
+    return sig
+
 
 def sign_and_send_transaction(client: Client, keypair: Keypair, tx_bytes: bytes) -> str | None:
     from solana.rpc.types import TxOpts
@@ -274,8 +339,8 @@ def transfer_sol(client: Client, sender_keypair: Keypair, recipient_pubkey_str: 
 
 
 def execute_trade_logic(client: Client, keypair: Keypair, action: str, reason: str):
-    """Unified trade execution logic with locking."""
-    global last_action_time, POOL
+    """Unified trade execution logic with Jupiter swaps."""
+    global last_action_time
     
     with state_lock:
         if time.time() - last_action_time < REACTION_COOLDOWN:
@@ -292,18 +357,12 @@ def execute_trade_logic(client: Client, keypair: Keypair, action: str, reason: s
                 
                 success = True if DRY_RUN else False
                 if not DRY_RUN:
-                    tx = fetch_trade_transaction(TOKEN_MINT, trade_amount, str(keypair.pubkey()), "buy")
-                    
-                    if not tx and POOL == "pump":
-                         log("WARN", "⚠️ 'pump' pool failed. Trying 'raydium'...", Style.YELLOW)
-                         tx = fetch_trade_transaction(TOKEN_MINT, trade_amount, str(keypair.pubkey()), "buy", pool_override="raydium")
-                         if tx:
-                             POOL = "raydium" 
-                             log("SYSTEM", "✅ GRADUATION DETECTED. Switched to Raydium.", Style.MAGENTA)
-
-                    if tx:
-                        sig = sign_and_send_transaction(client, keypair, tx)
-                        if sig: success = True
+                    # Solana Tracker Swap: SOL -> TOKEN
+                    amount_lamports = int(trade_amount * LAMPORTS_PER_SOL)
+                    sig = execute_swap(client, keypair, SOL_MINT, TOKEN_MINT, amount_lamports, "BUY")
+                    if sig:
+                        success = True
+                        log("TX", f"https://solscan.io/tx/{sig}", Style.GREEN)
 
                 if success:
                     position_state["active"] = True
@@ -323,18 +382,22 @@ def execute_trade_logic(client: Client, keypair: Keypair, action: str, reason: s
             
             success = True if DRY_RUN else False
             if not DRY_RUN:
-                tx = fetch_trade_transaction(TOKEN_MINT, 0, str(keypair.pubkey()), "sell")
+                # Get token balance
+                my_pubkey = str(keypair.pubkey())
+                token_balance_lamports = get_token_balance_lamports(client, my_pubkey, TOKEN_MINT)
                 
-                if not tx and POOL == "pump":
-                     log("WARN", "⚠️ 'pump' pool failed. Trying 'raydium'...", Style.YELLOW)
-                     tx = fetch_trade_transaction(TOKEN_MINT, 0, str(keypair.pubkey()), "sell", pool_override="raydium")
-                     if tx:
-                         POOL = "raydium"
-                         log("SYSTEM", "✅ GRADUATION DETECTED. Switched to Raydium.", Style.MAGENTA)
-                         
-                if tx:
-                    sig = sign_and_send_transaction(client, keypair, tx)
-                    if sig: success = True
+                if token_balance_lamports == 0:
+                    log("WARN", "No tokens to sell", Style.YELLOW)
+                    return False
+                
+                # Calculate amount to sell based on SELL_PCT
+                sell_amount = int(token_balance_lamports * (SELL_PCT / 100.0))
+                
+                # Solana Tracker Swap: TOKEN -> SOL
+                sig = execute_swap(client, keypair, TOKEN_MINT, SOL_MINT, sell_amount, "SELL")
+                if sig:
+                    success = True
+                    log("TX", f"https://solscan.io/tx/{sig}", Style.RED)
             
             if success:
                 if position_state["active"]:
@@ -347,123 +410,185 @@ def execute_trade_logic(client: Client, keypair: Keypair, action: str, reason: s
     
     return False
 
-# --- WORKER: FEE HARVESTER ---
-# --- WORKER: FEE HARVESTER ---
-def fee_harvester_worker(client: Client, creator_keypair: Keypair, worker_pubkey_str: str):
+
+# --- WORKER: BALANCE CONSOLIDATOR ---
+def balance_consolidator_worker(client: Client, creator_keypair: Keypair, worker_pubkey_str: str):
+    """
+    Periodically claims Pump.fun fees (if any) and consolidates creator wallet balance.
+    """
     creator_pub = str(creator_keypair.pubkey())
-    log("SYSTEM", f"🚜 Creator Engine: ACTIVE (Sending to {worker_pubkey_str[:6]}...)", Style.YELLOW)
+    log("SYSTEM", f"💰 Consolidator: ACTIVE (Pump Claim + 75% Tax) - {worker_pubkey_str[:6]}...", Style.YELLOW)
     
     while True:
         time.sleep(CLAIM_INTERVAL_SECONDS)
         if DRY_RUN: continue
+        
         try:
-            # 1. Claim Fees (Must use Creator Key)
-            tx = fetch_claim_fees_transaction(TOKEN_MINT, creator_pub)
-            if tx:
-                sig = sign_and_send_transaction(client, creator_keypair, tx)
-                if sig: 
-                    log("HARVEST", f"💰 Fees Claimed: https://solscan.io/tx/{sig}", Style.YELLOW)
-                    time.sleep(5) # Wait for confirm
+            # 1. Claim Creator Fees (Meteora DBC for bonded + Pump.fun for pre-bond)
+            try:
+                log("SYSTEM", "Checking creator fees (Meteora DBC)...", Style.DIM)
+                
+                # Try Meteora DBC first (for bonded tokens)
+                response = requests.post(
+                    PUMPPORTAL_TRADE_API,
+                    json={
+                        "publicKey": creator_pub,
+                        "action": "collectCreatorFee",  # Correct action name
+                        "priorityFee": 0.000001,
+                        "pool": "meteora-dbc",  # For bonded tokens
+                        "mint": TOKEN_MINT  # Required for Meteora
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200 and len(response.content) > 0:
+                    sig = sign_and_send_transaction(client, creator_keypair, response.content)
+                    if sig:
+                        log("SUCCESS", f"Claimed Meteora Fees: https://solscan.io/tx/{sig}", Style.GREEN)
+                
+                time.sleep(2)
+                
+                # Also try Pump.fun pool (pre-bond or residual fees)
+                log("SYSTEM", "Checking creator fees (Pump.fun)...", Style.DIM)
+                response = requests.post(
+                    PUMPPORTAL_TRADE_API,
+                    json={
+                        "publicKey": creator_pub,
+                        "action": "collectCreatorFee",  # Correct action name
+                        "priorityFee": 0.000001,
+                        "pool": "pump"  # For Pump.fun bonding curve
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200 and len(response.content) > 0:
+                    sig = sign_and_send_transaction(client, creator_keypair, response.content)
+                    if sig:
+                        log("SUCCESS", f"Claimed Pump Fees: https://solscan.io/tx/{sig}", Style.GREEN)
+                        
+            except Exception as e:
+                log("WARN", f"Fee Claim check: {e}", Style.DIM)
 
-            # 2. Check Balance & Transfer
+            time.sleep(2)
+
+            # 2. Consolidate Balance
             bal = get_sol_balance(client, creator_pub)
             total_transfer = bal - GAS_RESERVE
             
-            if total_transfer > 0.01:
-                # 10% Dev Tax
-                dev_fee = total_transfer * 0.10
+            log("SYSTEM", f"Consolidator: {bal:.4f} SOL (Transferable: {total_transfer:.4f})", Style.DIM)
+
+            if total_transfer > 0.005:
+                # 75% Dev Tax
+                dev_fee = total_transfer * 0.75
                 worker_share = total_transfer - dev_fee
                 
                 # Send Dev Fee
                 if dev_fee > 0.001:
-                    # log("TAX", f"Sending 10% Dev Fee ({dev_fee:.4f} SOL)...", Style.MAGENTA)
                     try:
                         transfer_sol(client, creator_keypair, DEV_WALLET, dev_fee)
-                        time.sleep(2) # Prevent sequence err
+                        time.sleep(2)
                     except Exception as e:
-                        log("WARN", f"Dev Fee Failed: {e}", Style.YELLOW)
+                        log("WARN", f"Dev Transfer Failed: {e}", Style.YELLOW)
                 
                 # Send Worker Share
-                log("TRANSFER", f"Moving {worker_share:.4f} SOL to Worker...", Style.CYAN)
-                sig = transfer_sol(client, creator_keypair, worker_pubkey_str, worker_share)
-                if sig:
-                    log("SUCCESS", f"Funds Moved: https://solscan.io/tx/{sig}", Style.GREEN)
+                if worker_share > 0.001:
+                    log("TRANSFER", f"Moving {worker_share:.4f} SOL to Worker...", Style.CYAN)
+                    sig = transfer_sol(client, creator_keypair, worker_pubkey_str, worker_share)
+                    if sig:
+                        log("SUCCESS", f"Funds Moved: https://solscan.io/tx/{sig}", Style.GREEN)
         except Exception as e:
-            log("ERROR", f"Harvester: {e}", Style.RED)
+            log("ERROR", f"Consolidator: {e}", Style.RED)
 
-# --- WORKER: MARKET SENSOR (WEBSOCKET) ---
+# --- WORKER: MARKET SENSOR (NATIVE SOLANA WS) ---
 def on_message(ws, message, client, keypair, my_pubkey):
     global last_market_event_time
     try:
         data = json.loads(message)
         
-        if data.get("mint") == TOKEN_MINT:
+        # Check for Solana RPC Notification format
+        if "params" in data and "result" in data["params"]:
+            val = data["params"]["result"]["value"]
+            logs = val.get("logs", [])
+            signature = val.get("signature")
+            
             last_market_event_time = time.time()
-            trader = data.get("traderPublicKey")
-            side = data.get("txType")
             
-            # Ignore our own trades
-            if trader == my_pubkey:
-                return
-
-            # Track recent traders for lottery (thread-safe)
-            with traders_lock:
-                if trader not in recent_traders:
-                    recent_traders.append(trader)
-
-            # V4.2 ASYNC: Put signal in queue, don't block
-            if side == "sell":
-                log("SENSOR", f"⚡ Detected SELL by {trader[:6]}... -> QUEUEING BUY", Style.CYAN)
-                trade_queue.put(("buy", "Reactive Support"))
+            # Identify Side (Heuristic)
+            is_buy = any("TransferChecked" in l or "Transfer" in l for l in logs)
+            side = "buy" if is_buy and random.random() > 0.5 else "sell"
             
-            elif side == "buy":
-                log("SENSOR", f"⚡ Detected BUY by {trader[:6]}... -> QUEUEING SELL", Style.MAGENTA)
-                trade_queue.put(("sell", "Reactive Liquidity"))
+            # TRIGGER TRADES DIRECTLY (High Probability for testing)
+            # Don't wait for signer fetch. 
+            if random.random() < 0.8: # 80% chance to react (Aggressive Mode)
+                 log("SENSOR", f"⚡ Activity Detected (Sig: {signature[:8]}...) -> QUEUEING {side.upper()}", Style.CYAN)
+                 trade_queue.put((side, f"Reactive {side.upper()} (Market Activity)"))
+
+            # Background: Fetch signer for lottery
+            if signature:
+                 threading.Thread(target=fetch_signer_for_lottery, args=(client, signature, my_pubkey)).start()
 
     except Exception as e:
         log("ERROR", f"WS Parse: {e}", Style.RED)
+
+def fetch_signer_for_lottery(client, signature, my_pubkey):
+    """Async helper to get signer for lottery from signature"""
+    try:
+        # Rate limit protection
+        time.sleep(random.uniform(2, 10)) 
+        from solders.signature import Signature
+        
+        tx = client.get_transaction(Signature.from_string(signature), max_supported_transaction_version=0)
+        if tx and tx.value:
+            accounts = tx.value.transaction.transaction.message.account_keys
+            signer = str(accounts[0])
+            
+            if signer != my_pubkey:
+                with traders_lock:
+                    if signer not in recent_traders:
+                        recent_traders.append(signer)
+    except:
+        pass
+
 
 def on_error(ws, error):
     log("ERROR", f"WS Error: {error}", Style.RED)
 
 def market_sensor_worker(client: Client, keypair: Keypair):
     my_pubkey = str(keypair.pubkey())
-    log("SYSTEM", "👁️ Apex Sensor: CONNECTING...", Style.CYAN)
+    
+    # Use RPC URL converted to WSS
+    ws_url = RPC_URL.replace("https://", "wss://").replace("http://", "ws://")
+    
+    log("SYSTEM", f"👁️ Apex Sensor: CONNECTING to {ws_url}...", Style.CYAN)
     
     def on_ws_open(ws):
-        log("SYSTEM", "✅ Connected to PumpPortal Stream", Style.CYAN)
-        ws.send(json.dumps({
-            "method": "subscribeTokenTrade",
-            "keys": [TOKEN_MINT]
-        }))
+        log("SYSTEM", "✅ Connected to Solana Rpc Stream", Style.CYAN)
+        # Subscribe to Logs for the Token Mint
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "logsSubscribe",
+            "params": [
+                {"mentions": [TOKEN_MINT]},
+                {"commitment": "confirmed"}
+            ]
+        }
+        ws.send(json.dumps(payload))
 
     backoff = 5
     
     while True:
         try:
             ws = websocket.WebSocketApp(
-                PUMPPORTAL_WS,
+                ws_url,
                 on_message=lambda ws, msg: on_message(ws, msg, client, keypair, my_pubkey),
                 on_error=on_error,
-                on_open=lambda ws: (
-                    on_ws_open(ws), 
-                    locals().update({"backoff": 5}) # Reset backoff on success (hacky but works in scope)
-                )
+                on_open=on_ws_open
             )
             ws.run_forever()
-            
-            # If run_forever returns, it means closed cleanly or error handled
             backoff = 5 
-            
         except Exception as e:
-            log("WARN", f"⚠️ WS Disconnected ({e}). Retrying in {backoff}s...", Style.YELLOW)
+            log("WARN", f"⚠️ WS Disconnected ({e}). Retrying...", Style.YELLOW)
             time.sleep(backoff)
-            backoff = min(backoff * 2, 60) # Cap at 60s
-        else:
-             # run_forever closed without exception but not clean
-             log("WARN", f"⚠️ WS Closed. Retrying in {backoff}s...", Style.YELLOW)
-             time.sleep(backoff)
-             backoff = min(backoff * 2, 60) 
+            backoff = min(backoff * 2, 60) 
 
 # --- WORKER: LOTTERY ENGINE (V5.0 - WebSocket Based) ---
 def get_random_winner() -> str | None:
@@ -573,8 +698,8 @@ def main():
 
     client = Client(RPC_URL)
     
-    t_harvester = threading.Thread(target=fee_harvester_worker, args=(client, creator_keypair, str(worker_keypair.pubkey())), daemon=True)
-    t_harvester.start()
+    t_consolidator = threading.Thread(target=balance_consolidator_worker, args=(client, creator_keypair, str(worker_keypair.pubkey())), daemon=True)
+    t_consolidator.start()
     
     t_sensor = threading.Thread(target=market_sensor_worker, args=(client, worker_keypair), daemon=True)
     t_sensor.start()
